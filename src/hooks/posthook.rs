@@ -26,7 +26,9 @@ use crate::core::tracking::{Tracker, estimate_tokens};
 use regex::Regex;
 use rtk_engine::block::{Block, ContentFormat, Event, Origin, Provenance, Subject};
 use rtk_engine::method::{Method, MethodCtx};
-use rtk_engine::pipeline::{Action, DecisionKind, Fact, Facts, Position, Resolved, evaluate};
+use rtk_engine::pipeline::{
+    Action, DecisionKind, Fact, Facts, Position, Resolved, ResolvedRule, evaluate, evaluate_where,
+};
 use serde_json::{Value, json};
 use std::io::{self, Write};
 use std::sync::LazyLock;
@@ -96,9 +98,16 @@ fn process(event: &Value) -> Option<(String, LoadedPipeline)> {
 /// guard applies: a failing command's single line is what a note is for.
 /// A shadow note rule is logged, not emitted. `None` when no note rule
 /// matched, or its chain returned nothing new.
+///
+/// Building the facts can read the transcript and call a classifier, so
+/// nothing is built unless a note rule exists for this subject.
 fn note_for(event: &Value, pipeline: &Resolved) -> Option<String> {
     let tool_name = event.get("tool_name")?.as_str()?;
     let subject = subject_of(tool_name);
+    let position = Position::hook(Event::AfterTool, subject);
+    if !has_note_rule(pipeline, position) {
+        return None;
+    }
     let duration_ms = event
         .get("duration_ms")
         .and_then(|d| d.as_u64())
@@ -139,16 +148,14 @@ fn note_for(event: &Value, pipeline: &Resolved) -> Option<String> {
         duration_ms,
         is_rtk_command,
     );
-    let position = Position::hook(Event::AfterTool, subject);
     let mut methods: Vec<&'static dyn Method> = Vec::new();
     let mut method_names: Vec<&'static str> = Vec::new();
     let mut rules: Vec<String> = Vec::new();
     let mut shadow = false;
-    for decision in evaluate(pipeline, position, &facts) {
+    for decision in evaluate_where(pipeline, position, &facts, &is_note_rule) {
         if let DecisionKind::Transform {
             methods: selected, ..
         } = &decision.kind
-            && is_note(&decision)
         {
             methods.extend_from_slice(selected);
             method_names.extend(selected.iter().map(|m| m.name()));
@@ -206,8 +213,19 @@ fn note_for(event: &Value, pipeline: &Resolved) -> Option<String> {
 
 /// A rule whose chain result is a note beside the tool's result rather than
 /// a replacement of it (`emit = "note"`).
-fn is_note(decision: &rtk_engine::pipeline::Decision<'_>) -> bool {
-    decision.rule.def.emit.as_deref() == Some("note")
+fn is_note_rule(rule: &ResolvedRule) -> bool {
+    rule.def.emit.as_deref() == Some("note")
+}
+
+/// Whether an active note rule sits at `position` or its `any` sibling —
+/// the only places [`note_for`] evaluates.
+fn has_note_rule(pipeline: &Resolved, position: Position) -> bool {
+    [position, position.any_sibling()].into_iter().any(|p| {
+        pipeline
+            .rules_at(p)
+            .iter()
+            .any(|r| r.def.enabled && !r.def.pro_inert && is_note_rule(r))
+    })
 }
 
 /// The hook response with `note` added as `additionalContext` after what is
@@ -423,10 +441,9 @@ fn run_selected(
     let position = Position::hook(Event::AfterTool, subject);
     shadow_eval_candidate(subject, format, source, raw, &facts);
     // Note rules never change the output: `note_for` runs them on their own.
-    let decisions: Vec<_> = evaluate(pipeline, position, &facts)
-        .into_iter()
-        .filter(|d| !is_note(d))
-        .collect();
+    // They are left out before evaluation, so a note rule on this subject
+    // neither stops the output rules nor holds back the `any` fallback.
+    let decisions = evaluate_where(pipeline, position, &facts, &|r| !is_note_rule(r));
     if decisions.is_empty() {
         return None;
     }
@@ -1400,6 +1417,59 @@ mod tests {
         assert!(stdout.len() < noisy.len());
         let note = hook["additionalContext"].as_str().expect("noted");
         assert!(note.starts_with("line 0: verbose build output"));
+    }
+
+    #[test]
+    fn the_note_pass_stays_off_without_a_note_rule_for_the_subject() {
+        let shell = Position::hook(Event::AfterTool, Subject::Shell);
+        assert!(!has_note_rule(&posthook_pipeline(), shell));
+        assert!(note_for(&colored_failure(), &posthook_pipeline()).is_none());
+
+        let read_only = pipeline_from(
+            "[pipeline]\nname = \"t\"\n[[hook.after_tool.read]]\nname = \"note\"\nuse = [\"ansi\"]\nemit = \"note\"\n",
+        );
+        assert!(!has_note_rule(&read_only, shell));
+        assert!(note_for(&colored_failure(), &read_only).is_none());
+
+        let disabled = pipeline_from(
+            "[pipeline]\nname = \"t\"\n[[hook.after_tool.shell]]\nname = \"note\"\nuse = [\"ansi\"]\nemit = \"note\"\nenabled = false\n",
+        );
+        assert!(!has_note_rule(&disabled, shell));
+
+        let any = pipeline_from(
+            "[pipeline]\nname = \"t\"\n[[hook.after_tool.any]]\nname = \"note\"\nuse = [\"ansi\"]\nemit = \"note\"\n",
+        );
+        assert!(has_note_rule(&any, shell));
+        assert!(note_for(&colored_failure(), &any).is_some());
+    }
+
+    #[test]
+    fn a_note_rule_does_not_silence_the_any_output_rules() {
+        let noisy = (0..400)
+            .map(|i| format!("\u{1b}[32mline {i}: verbose build output\u{1b}[0m"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let event = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "make build"},
+            "tool_response": {"stdout": noisy, "stderr": ""},
+            "duration_ms": 10
+        });
+        // With or without `continue`, the note rule is invisible to the
+        // output pass: the `any` rule still compresses the output.
+        for cont in ["continue = true\n", ""] {
+            let pipeline = pipeline_from(&format!(
+                "[pipeline]\nname = \"t\"\n[[hook.after_tool.shell]]\nname = \"note\"\nuse = [\"ansi\"]\nemit = \"note\"\n{cont}[[hook.after_tool.any]]\nname = \"strip\"\nuse = [\"ansi\"]\n"
+            ));
+            let out = run_with_notes(&event, &test_config(), &pipeline).expect("emitted");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            let hook = &v["hookSpecificOutput"];
+            let stdout = hook["updatedToolOutput"]["stdout"]
+                .as_str()
+                .unwrap_or_else(|| panic!("output not compressed ({cont:?})"));
+            assert!(!stdout.contains('\u{1b}'));
+            assert!(hook["additionalContext"].as_str().is_some(), "note missing");
+        }
     }
 
     #[test]
