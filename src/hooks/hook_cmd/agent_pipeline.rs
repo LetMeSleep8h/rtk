@@ -244,7 +244,7 @@ fn shell_gate(call: &ToolCall) -> Gate {
                 return Gate::Continue;
             };
             let verdict = permissions::check_command_for(cmd, host);
-            match decision::decide_for_agent(cmd, verdict) {
+            match decision::decide_for_agent(cmd, verdict, permissions::DenyRules::Unattested) {
                 HookDecision::AllowRewrite(_) => Gate::Swap {
                     command,
                     rule,

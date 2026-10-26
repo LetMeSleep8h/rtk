@@ -284,7 +284,6 @@ fn vibe_hooks_toml_has_entry(content: &str, name: &str) -> bool {
     content.contains(&needle)
 }
 
-#[cfg(test)]
 fn vibe_hooks_toml_has_rtk(content: &str) -> bool {
     vibe_hooks_toml_has_entry(content, VIBE_HOOK_NAME)
 }
@@ -439,6 +438,20 @@ fn strip_vibe_entry(content: &str, name: &str) -> Option<String> {
         out.push('\n');
     }
     Some(out)
+}
+
+/// Returns true if Vibe CLI RTK hook is configured.
+pub fn is_configured() -> bool {
+    let Ok(vibe_dir) = resolve_vibe_dir() else {
+        return false;
+    };
+    let hooks_path = vibe_dir.join(VIBE_HOOKS_FILE);
+    if let Ok(content) = fs::read_to_string(&hooks_path)
+        && vibe_hooks_toml_has_rtk(&content)
+    {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
