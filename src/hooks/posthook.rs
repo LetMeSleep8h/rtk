@@ -187,10 +187,17 @@ fn note_for(event: &Value, pipeline: &Resolved) -> Option<String> {
         return None;
     }
 
+    // Claude Code reports no exit status on success: 0 means the harness did
+    // not report a failure. An interrupted call arrives on PostToolUse too,
+    // but nothing says it succeeded, so it gets no exit code.
+    let interrupted = event
+        .pointer("/tool_response/interrupted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let exit_code = if failed {
         exit_code_of(&raw)
     } else {
-        (subject == Subject::Shell).then_some(0)
+        (subject == Subject::Shell && !interrupted).then_some(0)
     };
     let facts = rule_facts(
         pipeline,
@@ -488,8 +495,9 @@ fn run_selected(
     duration_ms: u64,
     is_rtk_command: Option<bool>,
 ) -> Option<Applied> {
-    // PostToolUse only carries calls that succeeded (failures go to
-    // PostToolUseFailure), so a shell call here exited 0.
+    // PostToolUse only carries calls the harness did not report as failed
+    // (failures go to PostToolUseFailure), so a shell call here gets 0.
+    // Interrupted calls never reach this pass (`process_shell` skips them).
     let facts = rule_facts(
         pipeline,
         subject,
@@ -1514,6 +1522,15 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_is_not_read_without_a_note_rule_for_its_subject() {
+        let read_only = pipeline_from(
+            "[pipeline]\nname = \"t\"\n[[hook.after_tool.read]]\nname = \"note\"\nuse = [\"ansi\"]\nemit = \"note\"\n",
+        );
+        assert!(note_for(&failure("Exit code 2\nerror: boom"), &read_only).is_none());
+        assert!(note_for(&failure("Exit code 2\nerror: boom"), &posthook_pipeline()).is_none());
+    }
+
+    #[test]
     fn exit_code_is_a_fact_after_a_shell_call() {
         // Only failures with exit code 2 are noted.
         let pipeline = pipeline_from(
@@ -1523,6 +1540,14 @@ mod tests {
         assert!(note_for(&failure("Exit code 1\n\u{1b}[31mboom\u{1b}[0m"), &pipeline).is_none());
         // A PostToolUse shell call succeeded: exit code 0.
         assert!(note_for(&colored_failure(), &pipeline).is_none());
+        // An interrupted call carries no exit code.
+        let zero = pipeline_from(
+            "[pipeline]\nname = \"t\"\n[[hook.after_tool.shell]]\nname = \"note\"\nwhen = { exit_code = 0 }\nuse = [\"ansi\"]\nemit = \"note\"\n",
+        );
+        assert!(note_for(&colored_failure(), &zero).is_some());
+        let mut interrupted = colored_failure();
+        interrupted["tool_response"]["interrupted"] = json!(true);
+        assert!(note_for(&interrupted, &zero).is_none());
         assert_eq!(exit_code_of("Exit code 127\nsh: x: not found"), Some(127));
         assert_eq!(exit_code_of("Exit code 3"), Some(3));
         assert_eq!(exit_code_of("permission denied"), None);
