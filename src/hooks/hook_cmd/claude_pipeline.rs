@@ -155,7 +155,7 @@ fn shell_gate(v: &Value) -> bool {
             if !swappable(
                 cmd,
                 verdict,
-                decision::decide_for_agent(cmd, verdict),
+                decision::decide_for_agent(cmd, verdict, permissions::DenyRules::Unattested),
                 &excluded,
                 &transparent,
             ) {
@@ -232,7 +232,13 @@ mod tests {
     use permissions::PermissionVerdict;
 
     fn decide(cmd: &str, verdict: PermissionVerdict, excluded: &[String]) -> bool {
-        let rewrite = decision::decide_with_params(cmd, verdict, excluded, &[]);
+        let rewrite = decision::decide_with_params(
+            cmd,
+            verdict,
+            excluded,
+            &[],
+            permissions::DenyRules::Unattested,
+        );
         let rewrite = decision::suppress_identity(cmd, rewrite);
         swappable(cmd, verdict, rewrite, excluded, &[])
     }
