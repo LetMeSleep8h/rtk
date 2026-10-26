@@ -187,6 +187,7 @@ fn swappable(
                 verdict,
                 PermissionVerdict::Allow | PermissionVerdict::Ask | PermissionVerdict::Default
             ) && !crate::discover::lexer::contains_unattestable_construct(cmd)
+                && !crate::discover::fish_script::is_unambiguous_fish(cmd)
                 && cmd.split_whitespace().next() != Some("rtk")
                 && !cmd.contains(['\n', '\r', '\\'])
                 && !registry::has_heredoc(cmd)
@@ -283,6 +284,17 @@ mod tests {
             "echo $((1 + 2))",
             "./run-suite.sh \\\n --fast",
             "./a.sh\n./b.sh",
+        ] {
+            assert!(!decide(cmd, PermissionVerdict::Allow, &[]), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn a_fish_script_is_never_swapped() {
+        for cmd in [
+            "test -d src; and git status",
+            "test -d src; and ./run-suite.sh",
+            "if test -d src\n  ./run-suite.sh\nend",
         ] {
             assert!(!decide(cmd, PermissionVerdict::Allow, &[]), "{cmd}");
         }
